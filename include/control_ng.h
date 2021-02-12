@@ -29,6 +29,10 @@ enum ng_command {
 	NGC_STOP_MEDIA,
 	NGC_PLAY_DTMF,
 	NGC_STATISTICS,
+	NGC_PUBLISH,
+	NGC_SUBSCRIBE_REQ,
+	NGC_SUBSCRIBE_ANS,
+	NGC_UNSUBSCRIBE,
 
 	NGC_COUNT // last, number of elements
 };

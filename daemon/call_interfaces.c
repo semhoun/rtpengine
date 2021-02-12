@@ -890,7 +890,7 @@ static void call_ng_flags_flags(struct sdp_ng_flags *out, str *s, void *dummy) {
 						&out->codec_except))
 				return;
 #ifdef WITH_TRANSCODING
-			if (out->opmode == OP_OFFER) {
+			if (out->opmode == OP_OFFER || out->opmode == OP_REQUEST) {
 				if (call_ng_flags_prefix(out, s, "transcode-", call_ng_flags_codec_list,
 							&out->codec_transcode))
 					return;
@@ -943,6 +943,7 @@ static void call_ng_process_flags(struct sdp_ng_flags *out, bencode_item_t *inpu
 	bencode_dictionary_get_str(input, "label", &out->label);
 	bencode_dictionary_get_str(input, "address", &out->address);
 	bencode_dictionary_get_str(input, "sdp", &out->sdp);
+	bencode_dictionary_get_str(input, "interface", &out->interface);
 
 	diridx = 0;
 	if ((list = bencode_dictionary_get_expect(input, "direction", BENCODE_LIST))) {
@@ -1123,7 +1124,7 @@ static void call_ng_process_flags(struct sdp_ng_flags *out, bencode_item_t *inpu
 		call_ng_flags_list(out, dict, "offer", call_ng_flags_codec_list, &out->codec_offer);
 		call_ng_flags_list(out, dict, "except", call_ng_flags_str_ht, &out->codec_except);
 #ifdef WITH_TRANSCODING
-		if (opmode == OP_OFFER) {
+		if (opmode == OP_OFFER || opmode == OP_REQUEST) {
 			call_ng_flags_list(out, dict, "transcode", call_ng_flags_codec_list, &out->codec_transcode);
 			call_ng_flags_list(out, dict, "mask", call_ng_flags_codec_list, &out->codec_mask);
 			call_ng_flags_list(out, dict, "set", call_ng_flags_str_ht_split, &out->codec_set);
@@ -2447,6 +2448,216 @@ out:
 	return "unsupported";
 #endif
 }
+
+
+const char *call_publish_ng(bencode_item_t *input, bencode_item_t *output) {
+	AUTO_CLEANUP(struct sdp_ng_flags flags, call_ng_free_flags);
+	AUTO_CLEANUP(GQueue parsed, sdp_free) = G_QUEUE_INIT;
+	AUTO_CLEANUP(GQueue streams, sdp_streams_free) = G_QUEUE_INIT;
+	AUTO_CLEANUP(str sdp_in, str_free_dup) = STR_NULL;
+	AUTO_CLEANUP(str sdp_out, str_free_dup) = STR_NULL;
+
+	call_ng_process_flags(&flags, input, OP_OTHER);
+
+	if (!flags.sdp.s)
+		return "No SDP body in message";
+	if (!flags.call_id.s)
+		return "No call-id in message";
+	if (!flags.from_tag.s)
+		return "No from-tag in message";
+
+	str_init_dup_str(&sdp_in, &flags.sdp);
+
+	if (sdp_parse(&sdp_in, &parsed, &flags))
+		return "Failed to parse SDP";
+	if (sdp_streams(&parsed, &streams, &flags))
+		return "Incomplete SDP specification";
+
+	struct call *call = call_get_or_create(&flags.call_id, 0);
+	struct call_monologue *ml = call_get_or_create_monologue(call, &flags.from_tag);
+
+	int ret = monologue_publish(ml, &streams, &flags);
+	if (ret)
+		ilog(LOG_ERR, "Publish error"); // XXX close call? handle errors?
+
+	ret = sdp_create(&sdp_out, ml, &flags);
+	if (!ret) {
+		save_last_sdp(ml, &sdp_in, &parsed, &streams);
+		bencode_buffer_destroy_add(output->buffer, g_free, sdp_out.s);
+		bencode_dictionary_add_str(output, "sdp", &sdp_out);
+		sdp_out = STR_NULL; // ownership passed to output
+	}
+
+	rwlock_unlock_w(&call->master_lock);
+	obj_put(call);
+
+	if (!ret)
+		return NULL;
+	return "Failed to create SDP";
+}
+
+
+const char *call_subscribe_request_ng(bencode_item_t *input, bencode_item_t *output) {
+	const char *err = NULL;
+	AUTO_CLEANUP(struct sdp_ng_flags flags, call_ng_free_flags);
+	char rand_buf[65];
+
+	call_ng_process_flags(&flags, input, OP_REQUEST);
+
+	if (!flags.call_id.s)
+		return "No call-id in message";
+	if (!flags.from_tag.s)
+		return "No from-tag in message";
+	if (flags.sdp.len)
+		ilog(LOG_INFO, "Subscribe-request with SDP received - ignoring SDP");
+
+	// get source monologue
+	err = "Call ID not found";
+	struct call *call = call_get(&flags.call_id);
+	if (!call)
+		goto out;
+	err = "From-tag not found";
+	struct call_monologue *source_ml = call_get_monologue(call, &flags.from_tag);
+	if (!source_ml)
+		goto out;
+	err = "No SDP known for this from-tag";
+	if (!source_ml->last_in_sdp.len || !source_ml->last_in_sdp_parsed.length)
+		goto out;
+
+	// get destination monologue
+	if (!flags.to_tag.len) {
+		// generate one
+		flags.to_tag = STR_CONST_INIT(rand_buf);
+		rand_hex_str(flags.to_tag.s, flags.to_tag.len / 2);
+	}
+	struct call_monologue *dest_ml = call_get_or_create_monologue(call, &flags.to_tag);
+
+	struct sdp_chopper *chopper = sdp_chopper_new(&source_ml->last_in_sdp);
+	bencode_buffer_destroy_add(output->buffer, (free_func_t) sdp_chopper_destroy, chopper);
+
+	err = "Failed to request subscription";
+	int ret = monologue_subscribe_request(source_ml, dest_ml, &flags);
+	if (ret)
+		goto out;
+
+	ret = sdp_replace(chopper, &source_ml->last_in_sdp_parsed, dest_ml, &flags);
+	err = "Failed to rewrite SDP";
+	if (ret)
+		goto out;
+
+	if (chopper->output->len)
+		bencode_dictionary_add_string_len(output, "sdp", chopper->output->str, chopper->output->len);
+	bencode_dictionary_add_str_dup(output, "from-tag", &source_ml->tag);
+	bencode_dictionary_add_str_dup(output, "to-tag", &dest_ml->tag);
+
+	err = NULL;
+out:
+	if (call) {
+		rwlock_unlock_w(&call->master_lock);
+		obj_put(call);
+	}
+	return err;
+}
+
+
+const char *call_subscribe_answer_ng(bencode_item_t *input, bencode_item_t *output) {
+	const char *err = NULL;
+	AUTO_CLEANUP(struct sdp_ng_flags flags, call_ng_free_flags);
+	AUTO_CLEANUP(GQueue parsed, sdp_free) = G_QUEUE_INIT;
+	AUTO_CLEANUP(GQueue streams, sdp_streams_free) = G_QUEUE_INIT;
+
+	call_ng_process_flags(&flags, input, OP_REQ_ANSWER);
+
+	if (!flags.call_id.s)
+		return "No call-id in message";
+	if (!flags.from_tag.s)
+		return "No from-tag in message";
+	if (!flags.to_tag.s)
+		return "No to-tag in message";
+	if (!flags.sdp.len)
+		return "No SDP body in message";
+
+	// get source monologue
+	err = "Call ID not found";
+	struct call *call = call_get(&flags.call_id);
+	if (!call)
+		goto out;
+	err = "From-tag not found";
+	struct call_monologue *source_ml = call_get_monologue(call, &flags.from_tag);
+	if (!source_ml)
+		goto out;
+
+	// get destination monologue
+	err = "To-tag not found";
+	struct call_monologue *dest_ml = call_get_or_create_monologue(call, &flags.to_tag);
+	if (!dest_ml)
+		goto out;
+
+	err = "Failed to parse SDP";
+	if (sdp_parse(&flags.sdp, &parsed, &flags))
+		goto out;
+	err = "Incomplete SDP specification";
+	if (sdp_streams(&parsed, &streams, &flags))
+		goto out;
+
+	err = "Failed to process subscription answer";
+	int ret = monologue_subscribe_answer(source_ml, dest_ml, &flags, &streams);
+	if (ret)
+		goto out;
+
+	err = NULL;
+out:
+	if (call) {
+		rwlock_unlock_w(&call->master_lock);
+		obj_put(call);
+	}
+	return err;
+}
+
+
+const char *call_unsubscribe_ng(bencode_item_t *input, bencode_item_t *output) {
+	const char *err = NULL;
+	AUTO_CLEANUP(struct sdp_ng_flags flags, call_ng_free_flags);
+
+	call_ng_process_flags(&flags, input, OP_OTHER);
+
+	if (!flags.call_id.s)
+		return "No call-id in message";
+	if (!flags.from_tag.s)
+		return "No from-tag in message";
+	if (!flags.to_tag.s)
+		return "No to-tag in message";
+
+	// get source monologue
+	err = "Call ID not found";
+	struct call *call = call_get(&flags.call_id);
+	if (!call)
+		goto out;
+	err = "From-tag not found";
+	struct call_monologue *source_ml = call_get_monologue(call, &flags.from_tag);
+	if (!source_ml)
+		goto out;
+
+	// get destination monologue
+	err = "To-tag not found";
+	struct call_monologue *dest_ml = call_get_or_create_monologue(call, &flags.to_tag);
+	if (!dest_ml)
+		goto out;
+
+	err = "Failed to unsubscribe";
+	int ret = monologue_unsubscribe(source_ml, dest_ml, &flags);
+	if (ret)
+		goto out;
+
+	err = NULL;
+out:
+	if (call) {
+		rwlock_unlock_w(&call->master_lock);
+		obj_put(call);
+	}
+	return err;
+}
+
 
 void call_interfaces_free() {
 	if (info_re) {

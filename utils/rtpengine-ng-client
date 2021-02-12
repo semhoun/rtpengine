@@ -185,9 +185,19 @@ my $resp = $engine->req(\%packet);
 #print Dumper $resp;
 #exit;
 
+if (exists($$resp{result}) && $$resp{result} eq 'ok') {
+	delete $$resp{result};
+}
+
 if (defined($$resp{sdp})) {
 	print("New SDP:\n-----8<-----8<-----8<-----8<-----8<-----\n$$resp{sdp}\n".
 		"----->8----->8----->8----->8----->8-----\n");
+	delete $$resp{sdp};
+	if (%$resp) {
+		print("Result dictionary:\n-----8<-----8<-----8<-----8<-----8<-----\n"
+			. Dumper($resp)
+			. "----->8----->8----->8----->8----->8-----\n");
+	}
 }
 else {
 	local $Data::Dumper::Indent = 1;
